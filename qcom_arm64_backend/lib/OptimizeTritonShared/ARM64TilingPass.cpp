@@ -98,6 +98,45 @@ static LogicalResult tileMmt4DOp(linalg::Mmt4DOp op, arm64VectorExtension vector
   return success();
 }
 
+// Tile the two innermost (swapped) dimensions of a transpose to one SME ZA
+// tile, [s]x[s], and all outer dimensions to 1. Vectorization then reads each
+// tile with a transposing transfer_read, which ArmSME lowers to rows written
+// into ZA as vertical slices and stored back horizontally.
+static LogicalResult tileTransposeForSME(linalg::TransposeOp op,
+                                         int64_t tileSize) {
+  IRRewriter rewriter(op.getContext());
+  rewriter.setInsertionPoint(op);
+  Location loc = op.getLoc();
+
+  Value vscale =
+      vector::VectorScaleOp::create(rewriter, loc, rewriter.getIndexType());
+  Value size = arith::ConstantIndexOp::create(rewriter, loc, tileSize);
+  OpFoldResult scaled = arith::MulIOp::create(rewriter, loc, size, vscale).getResult();
+
+  unsigned numLoops = op.getNumLoops();
+  SmallVector<OpFoldResult> tileSizes(numLoops, rewriter.getIndexAttr(1));
+  tileSizes[numLoops - 2] = scaled;
+  tileSizes[numLoops - 1] = scaled;
+
+  scf::SCFTilingOptions options;
+  options.setTileSizes(tileSizes);
+  auto tiled = scf::tileUsingSCF(
+      rewriter, cast<TilingInterface>(op.getOperation()), options);
+  if (failed(tiled))
+    return failure();
+  for (Operation *tiledOp : tiled->tiledOps)
+    tiledOp->setAttr(kSMETransposeTileAttr, rewriter.getUnitAttr());
+  rewriter.replaceOp(op, tiled->replacements);
+  return success();
+}
+
+// Whether a transpose is large enough for the ZA tile path to pay off. Shapes
+// that are not static keep the regular path.
+static bool isLargeEnoughForSMETranspose(linalg::TransposeOp op) {
+  auto type = op.getInit().getType();
+  return type.hasStaticShape() && type.getNumElements() >= kSMETransposeMinElements;
+}
+
 // Tile height dimensions, OH and KH, then decompose NCHW/FCHW convolution to
 // NCW/FCW.
 static LogicalResult tileAndDecomposeConv2D(linalg::Conv2DNchwFchwOp op) {
@@ -163,6 +202,10 @@ static LogicalResult tileLinalgOp(linalg::LinalgOp op, arm64VectorExtension vect
     return tileConv1D(cast<linalg::Conv1DNcwFcwOp>(op));
   if (isa<linalg::Mmt4DOp>(op))
     return tileMmt4DOp(cast<linalg::Mmt4DOp>(op), vectorExt, numLoops);
+  if (vectorExt == SME)
+    if (int64_t tileSize = getSMETransposeTileSize(op))
+      if (isLargeEnoughForSMETranspose(cast<linalg::TransposeOp>(op)))
+        return tileTransposeForSME(cast<linalg::TransposeOp>(op), tileSize);
 
   linalg::LinalgOp tilingTarget = op;
   linalg::LinalgTilingOptions tileOption;
@@ -244,6 +287,26 @@ struct TritonARM64LinalgTilingPass
 };
 
 } // namespace
+
+int64_t triton::getSMETransposeTileSize(Operation *op) {
+  auto transposeOp = dyn_cast<linalg::TransposeOp>(op);
+  if (!transposeOp)
+    return 0;
+  ArrayRef<int64_t> perm = transposeOp.getPermutation();
+  int64_t rank = perm.size();
+  if (rank < 2 || perm[rank - 1] != rank - 2 || perm[rank - 2] != rank - 1)
+    return 0;
+  for (int64_t i = 0; i < rank - 2; ++i)
+    if (perm[i] != i)
+      return 0;
+  Type elemType = transposeOp.getInit().getType().getElementType();
+  if (!elemType.isIntOrFloat())
+    return 0;
+  unsigned bits = elemType.getIntOrFloatBitWidth();
+  if (bits != 8 && bits != 16 && bits != 32 && bits != 64)
+    return 0;
+  return 128 / bits;
+}
 
 std::unique_ptr<OperationPass<ModuleOp>>
 triton::createTritonARM64LinalgTilingPass(const TritonARM64LinalgTilingOptions &options) {

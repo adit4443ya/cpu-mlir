@@ -205,3 +205,37 @@ func.func @test_conv2d_decomposes_to_conv1d(
     outs(%output : tensor<1x4x3x4xf32>) -> tensor<1x4x3x4xf32>
   return %0 : tensor<1x4x3x4xf32>
 }
+
+// A transpose of the two innermost dimensions with at least 2^19 elements is
+// tiled to one [4]x[4] SME tile on SME, and the tile is marked for the
+// vectorizer; on SVE only the innermost dimension is scalable.
+// CHECK-LABEL:     func.func @test_transpose_inner_dims
+// CHECK:           linalg.transpose ins({{.+}} : tensor<1x1x?x1xf32>) outs({{.+}} : tensor<1x1x1x?xf32>)
+// CHECK-NOT:       arm64.sme_transpose_tile
+// CHECK-SME-LABEL: func.func @test_transpose_inner_dims
+// CHECK-SME:       [[TILE:%.+]] = arith.muli {{.+}}, {{.+}} : index
+// CHECK-SME:       scf.for {{.+}} to %c64{{.*}} step [[TILE]]
+// CHECK-SME:       scf.for {{.+}} to %c1024{{.*}} step [[TILE]]
+// CHECK-SME:       linalg.transpose ins({{.+}} : tensor<1x1x?x?xf32>) outs({{.+}} : tensor<1x1x?x?xf32>) permutation = [0, 1, 3, 2] {arm64.sme_transpose_tile}
+func.func @test_transpose_inner_dims(%arg0: tensor<1x12x1024x64xf32>, %arg1: tensor<1x12x64x1024xf32>) -> tensor<1x12x64x1024xf32> {
+  %0 = linalg.transpose ins(%arg0 : tensor<1x12x1024x64xf32>) outs(%arg1 : tensor<1x12x64x1024xf32>) permutation = [0, 1, 3, 2]
+  return %0 : tensor<1x12x64x1024xf32>
+}
+
+// A small transpose keeps the regular path on SME: the per-call cost of
+// streaming mode outweighs the ZA tile transpose.
+// CHECK-SME-LABEL: func.func @test_transpose_inner_dims_small
+// CHECK-SME:       linalg.transpose ins({{.+}} : tensor<1x1x?x1xf32>) outs({{.+}} : tensor<1x1x1x?xf32>)
+// CHECK-SME-NOT:   arm64.sme_transpose_tile
+func.func @test_transpose_inner_dims_small(%arg0: tensor<1x12x7x64xf32>, %arg1: tensor<1x12x64x7xf32>) -> tensor<1x12x64x7xf32> {
+  %0 = linalg.transpose ins(%arg0 : tensor<1x12x7x64xf32>) outs(%arg1 : tensor<1x12x64x7xf32>) permutation = [0, 1, 3, 2]
+  return %0 : tensor<1x12x64x7xf32>
+}
+
+// A transpose that keeps the innermost dimension is not an SME tile transpose.
+// CHECK-SME-LABEL: func.func @test_transpose_outer_dims
+// CHECK-SME:       linalg.transpose ins({{.+}} : tensor<1x1x1x?xf16>) outs({{.+}} : tensor<1x1x1x?xf16>) permutation = [0, 2, 1, 3]
+func.func @test_transpose_outer_dims(%arg0: tensor<1x7x12x64xf16>, %arg1: tensor<1x12x7x64xf16>) -> tensor<1x12x7x64xf16> {
+  %0 = linalg.transpose ins(%arg0 : tensor<1x7x12x64xf16>) outs(%arg1 : tensor<1x12x7x64xf16>) permutation = [0, 2, 1, 3]
+  return %0 : tensor<1x12x7x64xf16>
+}

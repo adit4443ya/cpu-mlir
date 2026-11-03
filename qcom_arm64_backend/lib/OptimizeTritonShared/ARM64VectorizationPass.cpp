@@ -108,6 +108,12 @@ static LogicalResult vectorizeLinalgOp(linalg::LinalgOp op, arm64VectorExtension
     if (numLoops != 5)
       return failure();
     vecSizes = {1, 4, 4, 1, 1};
+  } else if (int64_t tileSize = vectorExt == SME && op->hasAttr(kSMETransposeTileAttr)
+                                    ? getSMETransposeTileSize(op) : 0) {
+    // One [s]x[s] ZA tile per transpose; ArmSME lowers the transposing read
+    // through ZA (rows in as vertical slices, out as horizontal slices).
+    vecSizes[numLoops - 2] = vecSizes[numLoops - 1] = tileSize;
+    scalableDims[numLoops - 2] = scalableDims[numLoops - 1] = true;
   } else if (isa<linalg::MatmulOp>(op) && vectorExt == SME) {
     scalableDims = {true, true, false};
     vecSizes = {8, 8, 2};

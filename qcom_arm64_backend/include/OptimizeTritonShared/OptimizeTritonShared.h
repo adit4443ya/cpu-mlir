@@ -38,6 +38,21 @@ std::unique_ptr<OperationPass<func::FuncOp>> createTritonARM64PuntBufferPass();
 
 std::unique_ptr<OperationPass<func::FuncOp>> createTritonARM64BubbleUpExtractSlicePass();
 
+// If `op` is a linalg.transpose that swaps its two innermost dimensions and its
+// element type fits an SME ZA tile, returns the tile size per vscale (128 /
+// element bits, e.g. 4 for f32 and 8 for f16). Otherwise returns 0.
+int64_t getSMETransposeTileSize(Operation *op);
+
+// Transposes with fewer elements than this keep the regular SVE path: below
+// it the per-call cost of streaming mode outweighs the ZA tile transpose
+// (measured on device: about even at 262K elements, 1.6x faster at 786K).
+constexpr int64_t kSMETransposeMinElements = 1 << 19;
+
+// Set by the tiling pass on each tile of a transpose it tiled for SME, so the
+// vectorization pass, which only sees dynamically shaped tiles, vectorizes it
+// as one ZA tile.
+constexpr llvm::StringLiteral kSMETransposeTileAttr = "arm64.sme_transpose_tile";
+
 } // namespace triton
 } // namespace mlir
 
