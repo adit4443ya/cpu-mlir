@@ -15,6 +15,7 @@ add_mlir_conversion_library(OptimizeTritonShared
 	OptimizeTritonSharedPassIncGen
 
         LINK_LIBS PUBLIC
+        MLIRValueBoundsOpInterface
         MLIRBufferizationDialect
         MLIRBufferizationPipelines
         MLIRBufferizationTransforms
