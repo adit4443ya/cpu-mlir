@@ -93,7 +93,8 @@ supported = {
 
     # QC-internal tests
     "test_activations.py",
-    "test_flash_attention.py"
+    "test_flash_attention.py",
+    "test_transpose.py"
 }
 
 def pytest_collection_modifyitems(config, items):
