@@ -270,3 +270,31 @@ func.func @test_transpose_outer_dims(%arg0: tensor<1x1024x12x64xf16>, %arg1: ten
   %0 = linalg.transpose ins(%arg0 : tensor<1x1024x12x64xf16>) outs(%arg1 : tensor<1x12x1024x64xf16>) permutation = [0, 2, 1, 3]
   return %0 : tensor<1x12x1024x64xf16>
 }
+
+// A copy between dynamically shaped, strided buffers (triton-shared's masked
+// tl.load) would be lowered to a call to the element-by-element memrefCopy
+// runtime function: it becomes a linalg.copy tiled to 4 x vscale, which the
+// vectorizer turns into masked vector loads and stores.
+// CHECK-SME-LABEL: func.func @test_strided_copy
+// CHECK-SME-NOT:   memref.copy
+// CHECK-SME:       [[VSCALE:%.+]] = vector.vscale
+// CHECK-SME:       [[STEP:%.+]] = arith.muli %c4{{.*}}, [[VSCALE]] : index
+// CHECK-SME:       scf.for {{.+}} step [[STEP]]
+// CHECK-SME:         linalg.copy ins({{.+}} : memref<?xf32, strided<[1], offset: ?>>) outs({{.+}} : memref<?xf32, strided<[1], offset: ?>>)
+func.func @test_strided_copy(%src: memref<1024xf32, strided<[1], offset: ?>>, %n: index) {
+  %buf = memref.alloc() : memref<1024xf32>
+  %s = memref.subview %src[0] [%n] [1] : memref<1024xf32, strided<[1], offset: ?>> to memref<?xf32, strided<[1], offset: ?>>
+  %d = memref.subview %buf[0] [%n] [1] : memref<1024xf32> to memref<?xf32, strided<[1]>>
+  memref.copy %s, %d : memref<?xf32, strided<[1], offset: ?>> to memref<?xf32, strided<[1]>>
+  memref.dealloc %buf : memref<1024xf32>
+  return
+}
+
+// A copy that lowers to a plain memcpy (identity layout) is left alone.
+// CHECK-SME-LABEL: func.func @test_contiguous_copy
+// CHECK-SME:       memref.copy %{{.+}}, %{{.+}} : memref<1024xf32> to memref<1024xf32>
+// CHECK-SME-NOT:   linalg.copy
+func.func @test_contiguous_copy(%src: memref<1024xf32>, %dst: memref<1024xf32>) {
+  memref.copy %src, %dst : memref<1024xf32> to memref<1024xf32>
+  return
+}
