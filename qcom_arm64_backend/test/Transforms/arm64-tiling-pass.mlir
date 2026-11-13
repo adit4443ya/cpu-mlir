@@ -23,10 +23,11 @@ func.func @test_elementwise_add(%arg0: tensor<128xf32>,
   return %0 : tensor<128xf32>
 }
 
+// Reductions get two SVE registers' worth per iteration: 8 x vscale.
 // CHECK-LABEL: func.func @test_reduce
 // CHECK: [[VSCALE:%.+]] = vector.vscale
-// CHECK: [[CONST4:%.+]] = arith.constant 4 : index
-// CHECK: [[STEP_S:%.+]] = arith.muli [[CONST4]], [[VSCALE]]
+// CHECK: [[CONST8:%.+]] = arith.constant 8 : index
+// CHECK: [[STEP_S:%.+]] = arith.muli [[CONST8]], [[VSCALE]]
 // CHECK: scf.for {{.+}} step [[STEP_S]]
 func.func @test_reduce(%arg0: tensor<128xf32>,
                         %arg1: tensor<f32>) -> tensor<f32> {
@@ -110,13 +111,17 @@ func.func @test_elementwise_2d(%arg0: tensor<32x128xf32>,
   return %0 : tensor<32x128xf32>
 }
 
-// CHECK-LABEL: func.func @test_generic_no_scalable
-// CHECK-NOT:   vector.vscale
-// CHECK:       arith.constant 1 : index
-// CHECK:       arith.constant 8 : index
-// CHECK:       scf.for
-// CHECK:       scf.for
-func.func @test_generic_no_scalable(%arg0: tensor<64x64xf32>,
+// A linalg.generic whose innermost loop is its reduction (torch-mlir's form
+// of a row sum or max) is tiled like linalg.reduce: rows by 1, the reduction
+// by 8 x vscale.
+// CHECK-LABEL: func.func @test_generic_innermost_reduction
+// CHECK:       [[VSCALE:%.+]] = vector.vscale
+// CHECK:       [[CONST8:%.+]] = arith.constant 8 : index
+// CHECK:       [[STEP_S:%.+]] = arith.muli [[CONST8]], [[VSCALE]]
+// CHECK:       scf.for {{.+}} to %c64{{.*}} step %c1
+// CHECK:         scf.for {{.+}} to %c64{{.*}} step [[STEP_S]]
+// CHECK:           linalg.generic {{.+}} iterator_types = ["parallel", "reduction"]{{.+}} ins({{.+}} : tensor<1x?xf32>)
+func.func @test_generic_innermost_reduction(%arg0: tensor<64x64xf32>,
                                      %arg1: tensor<64xf32>) -> tensor<64xf32> {
   %0 = linalg.generic {
     indexing_maps = [

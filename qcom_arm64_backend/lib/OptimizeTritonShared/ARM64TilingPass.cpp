@@ -270,7 +270,7 @@ static LogicalResult tileLinalgOp(linalg::LinalgOp op, arm64VectorExtension vect
   bool lastTileSizeScalable = vectorExt != NEON &&
       (linalg::isElementwise(op) || isa<linalg::ReduceOp>(op) ||
       isa<linalg::MatvecOp>(op) || isa<linalg::MatmulOp>(op) ||
-      isa<linalg::Mmt4DOp>(op));
+      isa<linalg::Mmt4DOp>(op) || isInnermostReduction(op));
 
   if (lastTileSizeScalable) {
     tileOption.setTileSizeComputationFunction([&, tileSizes](OpBuilder &b,
@@ -291,7 +291,8 @@ static LogicalResult tileLinalgOp(linalg::LinalgOp op, arm64VectorExtension vect
       } else {
         for (int i = 0; i < numLoops - 1; ++i)
           sizes.push_back(b.create<arith::ConstantIndexOp>(Loc, tileSizes[i]));
-        auto val = b.create<arith::ConstantIndexOp>(Loc, 4);
+        auto val = b.create<arith::ConstantIndexOp>(
+            Loc, getScalableVectorSize(op));
         sizes.push_back(b.create<arith::MulIOp>(Loc, val, vscale).getResult());
       }
       return sizes;
@@ -371,6 +372,14 @@ struct TritonARM64LinalgTilingPass
 };
 
 } // namespace
+
+bool triton::isInnermostReduction(Operation *op) {
+  auto genericOp = dyn_cast<linalg::GenericOp>(op);
+  if (!genericOp || genericOp.getNumReductionLoops() != 1)
+    return false;
+  return genericOp.getIteratorTypesArray().back() ==
+         utils::IteratorType::reduction;
+}
 
 std::unique_ptr<OperationPass<ModuleOp>>
 triton::createTritonARM64LinalgTilingPass(const TritonARM64LinalgTilingOptions &options) {
