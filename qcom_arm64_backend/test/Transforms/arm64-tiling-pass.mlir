@@ -139,6 +139,37 @@ func.func @test_generic_innermost_reduction(%arg0: tensor<64x64xf32>,
   return %0 : tensor<64xf32>
 }
 
+// A matmul written as a linalg.generic (parallel, parallel, reduction) is not
+// an innermost reduction: its reduction dimension is not tiled by vscale.
+// (In the pipeline, specialization and MatmulToMmt4D turn it into mmt4d
+// before tiling.)
+// CHECK-LABEL: func.func @test_generic_matmul_not_innermost_reduction
+// CHECK-NOT:   vector.vscale
+// CHECK:       scf.for {{.+}} to %c64{{.*}} step %c1
+// CHECK:         scf.for {{.+}} to %c64{{.*}} step %c1
+// CHECK:           scf.for {{.+}} to %c64{{.*}} step %c8
+// CHECK:             linalg.generic {{.+}} iterator_types = ["parallel", "parallel", "reduction"]
+func.func @test_generic_matmul_not_innermost_reduction(
+    %a: tensor<64x64xf32>, %b: tensor<64x64xf32>,
+    %c: tensor<64x64xf32>) -> tensor<64x64xf32> {
+  %0 = linalg.generic {
+    indexing_maps = [
+      affine_map<(m, n, k) -> (m, k)>,
+      affine_map<(m, n, k) -> (k, n)>,
+      affine_map<(m, n, k) -> (m, n)>
+    ],
+    iterator_types = ["parallel", "parallel", "reduction"]
+  }
+  ins(%a, %b : tensor<64x64xf32>, tensor<64x64xf32>)
+  outs(%c : tensor<64x64xf32>) {
+    ^bb0(%x: f32, %y: f32, %acc: f32):
+      %m = arith.mulf %x, %y : f32
+      %s = arith.addf %acc, %m : f32
+      linalg.yield %s : f32
+  } -> tensor<64x64xf32>
+  return %0 : tensor<64x64xf32>
+}
+
 // CHECK-LABEL: func.func @test_mixed_tileable_and_memref
 // CHECK: [[VSCALE:%.+]] = vector.vscale
 // CHECK: [[CONST4:%.+]] = arith.constant 4 : index
