@@ -377,6 +377,13 @@ bool triton::isInnermostReduction(Operation *op) {
   auto genericOp = dyn_cast<linalg::GenericOp>(op);
   if (!genericOp || genericOp.getNumReductionLoops() != 1)
     return false;
+  // A matmul-like contraction ([parallel, parallel, reduction]) wants its
+  // parallel dims vectorized (outer products), not its reduction dim. Those
+  // that specialization and MatmulToMmt4D leave as generics keep the default
+  // schedule. A matvec (one parallel dim) is reduced like linalg.matvec.
+  if (linalg::isaContractionOpInterface(genericOp) &&
+      genericOp.getNumParallelLoops() > 1)
+    return false;
   return genericOp.getIteratorTypesArray().back() ==
          utils::IteratorType::reduction;
 }
