@@ -30,6 +30,8 @@
 #include "mlir/InitAllPasses.h"
 #include "llvm/Support/Debug.h"
 
+#include <cstdlib>
+
 #include "OptimizeTritonShared/Passes.h"
 
 namespace mlir {
@@ -67,7 +69,12 @@ static void addOptimizationPassesForSME(mlir::OpPassManager &pm) {
   pm.addPass(createCanonicalizerPass());
   // Keep streaming mode to the ZA loop nests. This must run after the inliner
   // above and before EnableArmStreamingPass below.
-  pm.addPass(createTritonARM64SMEFuncOutlinePass());
+  // Experimental: TRITON_ARM64_SSVE_REDUCTIONS=1 also runs reduction loop
+  // nests in streaming mode (SSVE), at the streaming vector length.
+  TritonARM64SMEFuncOutlineOptions outlineOptions;
+  const char *ssve = std::getenv("TRITON_ARM64_SSVE_REDUCTIONS");
+  outlineOptions.ssveReductions = ssve && StringRef(ssve) == "1";
+  pm.addPass(createTritonARM64SMEFuncOutlinePass(outlineOptions));
 
   pm.addPass(arm_sme::createVectorLegalizationPass());
   pm.addPass(createConvertVectorToArmSMEPass());
@@ -143,6 +150,13 @@ void addOptimizeTritonSharedPasses(mlir::OpPassManager &pm,
   // The vector lowering pass bufferizes, but bufferization never frees what it
   // allocates, so every program instance leaked its temporaries. This must run
   // while loops are still structured (SME lowers them to cf below).
+  // Allocate the per-iteration temporaries (e.g. the buffers of masked loads in
+  // a Triton k-loop) once, before the loop. Each malloc/free is a call, which
+  // in streaming code also means leaving and re-entering streaming mode.
+  // TEMPORARY A/B switch for measurements; remove before upstreaming.
+  if (!std::getenv("TRITON_ARM64_NO_BUFFER_HOIST"))
+    pm.addNestedPass<func::FuncOp>(
+        bufferization::createBufferLoopHoistingPass());
   bufferization::buildBufferDeallocationPipeline(pm);
   // Deallocs whose aliasing is only known at runtime (e.g. buffers returned
   // from loops) call a generated @dealloc_helper. Inline it: the driver

@@ -85,6 +85,12 @@ def TritonARM64SMEFuncOutline :
     dimensions are scalable) into a new private function and calls it, so that
     only the new function becomes streaming.
   }];
+  let options = [
+    Option<"ssveReductions", "ssve-reductions", "bool", /*default=*/"false",
+           "Also outline loop nests with scalable vector reductions and run "
+           "them in streaming mode (SSVE), where the vector length is the "
+           "streaming vector length">
+  ];
   let constructor = "triton::createTritonARM64SMEFuncOutlinePass()";
   let dependentDialects = ["mlir::func::FuncDialect", "mlir::LLVM::LLVMDialect"];
 }

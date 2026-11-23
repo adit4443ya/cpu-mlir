@@ -32,7 +32,9 @@ std::unique_ptr<OperationPass<ModuleOp>> createTritonARM64VectorLoweringPass(
     const TritonARM64VectorLoweringOptions &options = TritonARM64VectorLoweringOptions()
 );
 std::unique_ptr<OperationPass<ModuleOp>> createTritonARM64MatmulToMmt4DPass();
-std::unique_ptr<OperationPass<ModuleOp>> createTritonARM64SMEFuncOutlinePass();
+std::unique_ptr<OperationPass<ModuleOp>> createTritonARM64SMEFuncOutlinePass(
+    const TritonARM64SMEFuncOutlineOptions &options =
+        TritonARM64SMEFuncOutlineOptions());
 
 // Whether `op` is a linalg.generic whose only reduction loop is the innermost
 // one, as torch-mlir emits for the max and sum of a softmax. Tiling and
