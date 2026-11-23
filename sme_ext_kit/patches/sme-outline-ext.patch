@@ -1,0 +1,629 @@
+diff --git a/qcom_arm64_backend/include/OptimizeTritonShared/OptimizeTritonShared.h b/qcom_arm64_backend/include/OptimizeTritonShared/OptimizeTritonShared.h
+index e4ed1a3..f2a1099 100644
+--- a/qcom_arm64_backend/include/OptimizeTritonShared/OptimizeTritonShared.h
++++ b/qcom_arm64_backend/include/OptimizeTritonShared/OptimizeTritonShared.h
+@@ -32,7 +32,9 @@ std::unique_ptr<OperationPass<ModuleOp>> createTritonARM64VectorLoweringPass(
+     const TritonARM64VectorLoweringOptions &options = TritonARM64VectorLoweringOptions()
+ );
+ std::unique_ptr<OperationPass<ModuleOp>> createTritonARM64MatmulToMmt4DPass();
+-std::unique_ptr<OperationPass<ModuleOp>> createTritonARM64SMEFuncOutlinePass();
++std::unique_ptr<OperationPass<ModuleOp>> createTritonARM64SMEFuncOutlinePass(
++    const TritonARM64SMEFuncOutlineOptions &options =
++        TritonARM64SMEFuncOutlineOptions());
+ 
+ // Whether `op` is a linalg.generic whose only reduction loop is the innermost
+ // one, as torch-mlir emits for the max and sum of a softmax. Tiling and
+diff --git a/qcom_arm64_backend/include/OptimizeTritonShared/Passes.td b/qcom_arm64_backend/include/OptimizeTritonShared/Passes.td
+index c408b4c..1113cc2 100644
+--- a/qcom_arm64_backend/include/OptimizeTritonShared/Passes.td
++++ b/qcom_arm64_backend/include/OptimizeTritonShared/Passes.td
+@@ -85,6 +85,12 @@ def TritonARM64SMEFuncOutline :
+     dimensions are scalable) into a new private function and calls it, so that
+     only the new function becomes streaming.
+   }];
++  let options = [
++    Option<"ssveReductions", "ssve-reductions", "bool", /*default=*/"false",
++           "Also outline loop nests with scalable vector reductions and run "
++           "them in streaming mode (SSVE), where the vector length is the "
++           "streaming vector length">
++  ];
+   let constructor = "triton::createTritonARM64SMEFuncOutlinePass()";
+   let dependentDialects = ["mlir::func::FuncDialect", "mlir::LLVM::LLVMDialect"];
+ }
+diff --git a/qcom_arm64_backend/lib/LowerTritonLinalgToLLVM/LowerTritonLinalgToLLVM.cpp b/qcom_arm64_backend/lib/LowerTritonLinalgToLLVM/LowerTritonLinalgToLLVM.cpp
+index 0d7cd41..f54bbf3 100644
+--- a/qcom_arm64_backend/lib/LowerTritonLinalgToLLVM/LowerTritonLinalgToLLVM.cpp
++++ b/qcom_arm64_backend/lib/LowerTritonLinalgToLLVM/LowerTritonLinalgToLLVM.cpp
+@@ -62,7 +62,9 @@ bool doesFuncReturnValue(ModuleOp moduleOp) {
+ 
+   return moduleOp
+       .walk([&](func::FuncOp op) {
+-        if (!op.getResultTypes().empty())
++        // Only the entry points count: private helpers, such as an outlined
++        // SME loop that returns the values its loop carried, are internal.
++        if (op.isPublic() && !op.getResultTypes().empty())
+           return WalkResult::interrupt();
+         return WalkResult::advance();
+       }).wasInterrupted();
+diff --git a/qcom_arm64_backend/lib/OptimizeTritonShared/ARM64MatmulToMmt4DPass.cpp b/qcom_arm64_backend/lib/OptimizeTritonShared/ARM64MatmulToMmt4DPass.cpp
+index 62ef8fc..e969c69 100644
+--- a/qcom_arm64_backend/lib/OptimizeTritonShared/ARM64MatmulToMmt4DPass.cpp
++++ b/qcom_arm64_backend/lib/OptimizeTritonShared/ARM64MatmulToMmt4DPass.cpp
+@@ -11,6 +11,11 @@
+ #include "mlir/Dialect/Func/IR/FuncOps.h"
+ #include "mlir/Dialect/Linalg/IR/Linalg.h"
+ #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
++#include "mlir/Dialect/SCF/IR/SCF.h"
++#include "mlir/Dialect/Tensor/IR/Tensor.h"
++#include "mlir/IR/IRMapping.h"
++
++#include <cstdlib>
+ #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+ 
+ #include "OptimizeTritonShared/OptimizeTritonShared.h"
+@@ -49,11 +54,117 @@ struct LowerUnPackPattern : public OpRewritePattern<UnPackOp> {
+   }
+ };
+ 
++// In a loop that accumulates a matmul into a loop-carried tensor, such as the
++// k-loop of a Triton matmul, block packing packs the accumulator at the start
++// of every iteration and unpacks it at the end:
++//
++//   scf.for ... iter_args(%acc = %init) {
++//     %p = linalg.pack %acc ...
++//     %r = linalg.mmt4d ins(...) outs(%p)
++//     %u = linalg.unpack %r into %acc
++//     scf.yield %u
++//   }
++//
++// Carry the packed tensor instead, so that the accumulator is packed once
++// before the loop and unpacked once after it.
++static LogicalResult hoistPackedAccumulator(RewriterBase &rewriter,
++                                            scf::ForOp loop, unsigned idx) {
++  BlockArgument iterArg = loop.getRegionIterArg(idx);
++  auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
++  auto unpack = yield.getOperand(idx).getDefiningOp<linalg::UnPackOp>();
++  if (!unpack || !unpack->hasOneUse() || unpack->getBlock() != loop.getBody())
++    return failure();
++
++  // The accumulator may only be packed (once) and be the unpack destination.
++  linalg::PackOp pack;
++  for (OpOperand &use : iterArg.getUses()) {
++    auto user = dyn_cast<linalg::PackOp>(use.getOwner());
++    if (user && !pack && use.get() == user.getSource()) {
++      pack = user;
++      continue;
++    }
++    if (use.getOwner() == unpack.getOperation() &&
++        &use == &unpack.getDestMutable())
++      continue;
++    return failure();
++  }
++  // With padding, the unpack drops the padded rows and the next pack refills
++  // them with the padding value, which the packed tensor would not do.
++  if (!pack || pack.getPaddingValue() ||
++      pack.getDestType() != unpack.getSourceType() ||
++      !pack.getDestType().hasStaticShape() ||
++      !unpack.getDestType().hasStaticShape() ||
++      pack.getInnerDimsPos() != unpack.getInnerDimsPos() ||
++      pack.getOuterDimsPerm() != unpack.getOuterDimsPerm() ||
++      pack.getStaticInnerTiles() != unpack.getStaticInnerTiles() ||
++      !pack.getInnerTiles().empty() || !unpack.getInnerTiles().empty())
++    return failure();
++
++  Location loc = loop.getLoc();
++  ShapedType packedType = pack.getDestType();
++  ShapedType unpackedType = unpack.getDestType();
++
++  // Pack the initial value before the loop.
++  rewriter.setInsertionPoint(loop);
++  Value packDest = tensor::EmptyOp::create(rewriter, loc, packedType.getShape(),
++                                           packedType.getElementType());
++  IRMapping packMapping;
++  packMapping.map(pack.getSource(), loop.getInitArgs()[idx]);
++  packMapping.map(pack.getDest(), packDest);
++  Value packedInit = rewriter.clone(*pack, packMapping)->getResult(0);
++
++  SmallVector<Value> inits(loop.getInitArgs());
++  inits[idx] = packedInit;
++  auto newLoop = scf::ForOp::create(
++      rewriter, loc, loop.getLowerBound(), loop.getUpperBound(),
++      loop.getStep(), inits, [](OpBuilder &, Location, Value, ValueRange) {},
++      loop.getUnsignedCmp());
++  newLoop->setDiscardableAttrs(loop->getDiscardableAttrDictionary());
++
++  // Unpack the final value after the loop.
++  rewriter.setInsertionPointAfter(newLoop);
++  Value unpackDest = tensor::EmptyOp::create(
++      rewriter, loc, unpackedType.getShape(), unpackedType.getElementType());
++  IRMapping unpackMapping;
++  unpackMapping.map(unpack.getSource(), newLoop.getResult(idx));
++  unpackMapping.map(unpack.getDest(), unpackDest);
++  Value result = rewriter.clone(*unpack, unpackMapping)->getResult(0);
++
++  // Move the body over: yield the packed result, use the packed iter_arg.
++  rewriter.modifyOpInPlace(
++      yield, [&] { yield.setOperand(idx, unpack.getSource()); });
++  rewriter.eraseOp(unpack);
++  Block *newBody = newLoop.getBody();
++  rewriter.mergeBlocks(loop.getBody(), newBody, newBody->getArguments());
++  rewriter.replaceAllUsesWith(pack.getResult(), newLoop.getRegionIterArg(idx));
++  rewriter.eraseOp(pack);
++
++  SmallVector<Value> results(newLoop.getResults());
++  results[idx] = result;
++  rewriter.replaceOp(loop, results);
++  return success();
++}
++
++static void hoistPackedAccumulators(Operation *root) {
++  IRRewriter rewriter(root->getContext());
++  SmallVector<scf::ForOp> loops;
++  root->walk([&](scf::ForOp loop) { loops.push_back(loop); });
++  for (scf::ForOp loop : loops) {
++    for (unsigned idx = 0; idx < loop.getNumRegionIterArgs(); ++idx) {
++      if (succeeded(hoistPackedAccumulator(rewriter, loop, idx))) {
++        DBG("hoisted the packing of accumulator #" << idx);
++        break; // `loop` was replaced
++      }
++    }
++  }
++}
++
+ struct TritonARM64MatmulToMmt4DPass
+     : public ::impl::TritonARM64MatmulToMmt4DBase<TritonARM64MatmulToMmt4DPass> {
+ public:
+   void getDependentDialects(DialectRegistry &registry) const override {
+-    registry.insert<func::FuncDialect>();
++    registry.insert<func::FuncDialect, scf::SCFDialect,
++                    tensor::TensorDialect>();
+   }
+ 
+   void runOnOperation() override {
+@@ -69,9 +180,6 @@ public:
+       return options;
+     };
+ 
+-    patterns.add<LowerPackPattern>(ctx);
+-    patterns.add<LowerUnPackPattern>(ctx);
+-
+     linalg::populateBlockPackMatmulPatterns(patterns, controlFn);
+     linalg::populateLinalgGenericOpsSpecializationPatterns(patterns);
+     linalg::populateFoldAddIntoDestPatterns(patterns);
+@@ -79,6 +187,19 @@ public:
+                                      std::move(patterns)))) {
+       return signalPassFailure();
+     }
++
++    // Before the packs are lowered: the hoisting matches pack/unpack pairs.
++    // TEMPORARY A/B switch for measurements; remove before upstreaming.
++    if (!std::getenv("TRITON_ARM64_NO_PACK_HOIST"))
++      hoistPackedAccumulators(getOperation());
++
++    RewritePatternSet lowerPatterns(ctx);
++    lowerPatterns.add<LowerPackPattern>(ctx);
++    lowerPatterns.add<LowerUnPackPattern>(ctx);
++    if (failed(applyPatternsGreedily(getOperation(),
++                                     std::move(lowerPatterns)))) {
++      return signalPassFailure();
++    }
+   }
+ };
+ 
+diff --git a/qcom_arm64_backend/lib/OptimizeTritonShared/ARM64SMEFuncOutlinePass.cpp b/qcom_arm64_backend/lib/OptimizeTritonShared/ARM64SMEFuncOutlinePass.cpp
+index dfe8561..e706d63 100644
+--- a/qcom_arm64_backend/lib/OptimizeTritonShared/ARM64SMEFuncOutlinePass.cpp
++++ b/qcom_arm64_backend/lib/OptimizeTritonShared/ARM64SMEFuncOutlinePass.cpp
+@@ -6,7 +6,9 @@
+ //   https://github.com/qualcomm/cpu-mlir/LICENSE.txt
+ //
+ // This file moves each loop nest that works on SME ZA tiles into its own
+-// function, so that only that function runs in streaming mode.
++// function, so that only that function runs in streaming mode. Optionally it
++// does the same for loop nests with scalable vector reductions, which then run
++// as streaming SVE (SSVE) code at the streaming vector length.
+ //===----------------------------------------------------------------------===//
+ #include "mlir/Dialect/Func/IR/FuncOps.h"
+ #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+@@ -18,6 +20,8 @@
+ 
+ #include "llvm/Support/Debug.h"
+ 
++#include <cstdlib>
++
+ #include "OptimizeTritonShared/OptimizeTritonShared.h"
+ 
+ #define DEBUG_TYPE "triton-arm64-sme-func-outline"
+@@ -54,6 +58,48 @@ static bool usesZATiles(Operation *root) {
+   return result.wasInterrupted();
+ }
+ 
++static bool isScalableVectorType(Type type) {
++  auto vecType = dyn_cast<VectorType>(type);
++  return vecType && vecType.isScalable();
++}
++
++// An in-order floating-point sum or product of a scalable vector. LLVM lowers
++// it to FADDA, which is illegal in streaming mode and which it cannot expand
++// for scalable vectors ("Expanding reductions for scalable vectors is
++// undefined"). With `reassoc` it becomes FADDV, which is legal.
++static bool isOrderedFloatReduction(vector::ReductionOp reduction) {
++  vector::CombiningKind kind = reduction.getKind();
++  return (kind == vector::CombiningKind::ADD ||
++          kind == vector::CombiningKind::MUL) &&
++         isa<FloatType>(reduction.getDest().getType()) &&
++         !bitEnumContainsAll(reduction.getFastmath(),
++                             arith::FastMathFlags::reassoc);
++}
++
++// A loop nest that reduces scalable vectors and that is legal in streaming
++// mode. Gathers and scatters are not: without FEAT_SME_FA64 the SVE gather
++// and scatter instructions are illegal in streaming mode.
++static bool isSSVEReductionNest(Operation *root) {
++  bool hasReduction = false;
++  WalkResult result = root->walk([&](Operation *op) {
++    if (isa<vector::GatherOp, vector::ScatterOp>(op))
++      return WalkResult::interrupt();
++    if (auto reduction = dyn_cast<vector::ReductionOp>(op)) {
++      if (!isScalableVectorType(reduction.getVector().getType()))
++        return WalkResult::advance();
++      if (isOrderedFloatReduction(reduction))
++        return WalkResult::interrupt();
++      hasReduction = true;
++    }
++    // The vector lowering has turned these into vector.reduction; one that
++    // is left could still become an in-order sum.
++    if (isa<vector::MultiDimReductionOp>(op))
++      return WalkResult::interrupt();
++    return WalkResult::advance();
++  });
++  return hasReduction && !result.wasInterrupted();
++}
++
+ // Whether `value` is computed from vector.vscale. Inside the outlined
+ // function, which runs in streaming mode, vscale is derived from the streaming
+ // vector length, which may differ from the SVE vector length the caller sees.
+@@ -98,9 +144,9 @@ static LogicalResult collectOutlinedInputs(scf::ForOp loop,
+ 
+   for (Value arg : argSet) {
+     DenseSet<Operation *> visited;
+-    // A vector would cross the streaming boundary, and a value computed from
+-    // vscale outside would use the wrong vector length.
+-    if (isa<VectorType>(arg.getType()) || dependsOnVScale(arg, visited))
++    // A scalable vector would change length at the streaming boundary, and a
++    // value computed from vscale outside would use the wrong vector length.
++    if (isScalableVectorType(arg.getType()) || dependsOnVScale(arg, visited))
+       return failure();
+   }
+   args.assign(argSet.begin(), argSet.end());
+@@ -108,11 +154,16 @@ static LogicalResult collectOutlinedInputs(scf::ForOp loop,
+ }
+ 
+ // Moves `loop` into a new private function after `parent` and replaces it with
+-// a call.
++// a call. The loop's results become the function's results, e.g. the pointer
++// offsets a Triton k-loop carries, or the accumulator of a reduction loop.
+ static LogicalResult outlineLoop(scf::ForOp loop, func::FuncOp parent,
+-                                 unsigned index) {
+-  // After bufferization the loop writes to memrefs and has no results.
+-  if (loop->getNumResults() != 0)
++                                 StringRef suffix, unsigned index,
++                                 bool streaming) {
++  if (llvm::any_of(loop->getResultTypes(), isScalableVectorType))
++    return failure();
++  // TEMPORARY A/B switch for measurements (old behaviour); remove before
++  // upstreaming.
++  if (std::getenv("TRITON_ARM64_NO_OUTLINE_RESULTS") && loop->getNumResults())
+     return failure();
+ 
+   SmallVector<Value> args;
+@@ -122,14 +173,25 @@ static LogicalResult outlineLoop(scf::ForOp loop, func::FuncOp parent,
+ 
+   OpBuilder builder(parent);
+   builder.setInsertionPointAfter(parent);
+-  std::string name = (parent.getSymName() + "_sme_" + Twine(index)).str();
+-  auto funcType = builder.getFunctionType(ValueRange(args).getTypes(), {});
++  std::string name =
++      (parent.getSymName() + "_" + suffix + "_" + Twine(index)).str();
++  auto funcType = builder.getFunctionType(ValueRange(args).getTypes(),
++                                          loop->getResultTypes());
+   auto func = func::FuncOp::create(builder, loop.getLoc(), name, funcType);
+   // Private and internal: only `parent` calls it, so it needs neither a C
+   // interface nor an exported symbol.
+   func.setPrivate();
+   func->setAttr("llvm.linkage", LLVM::LinkageAttr::get(builder.getContext(),
+                                                        LLVM::Linkage::Internal));
++  // ZA loops are made streaming by EnableArmStreamingPass, which also gives
++  // them ZA. That pass only looks for ZA ops, so SSVE functions get streaming
++  // mode here. Locally streaming: the function switches mode in its own
++  // prologue and epilogue, so the caller sets up the arguments in normal mode.
++  // With arm_streaming the caller does it after `smstart sm`, and LLVM
++  // materializes e.g. a <1 x float> zero there with NEON `movi`, which is
++  // illegal in streaming mode without FEAT_SME_FA64 (SIGILL).
++  if (streaming)
++    func->setAttr("llvm.arm_locally_streaming", builder.getUnitAttr());
+   Block *entry = func.addEntryBlock();
+ 
+   IRMapping mapping;
+@@ -137,17 +199,20 @@ static LogicalResult outlineLoop(scf::ForOp loop, func::FuncOp parent,
+   builder.setInsertionPointToStart(entry);
+   for (Operation *op : toClone)
+     builder.clone(*op, mapping);
+-  builder.clone(*loop, mapping);
+-  func::ReturnOp::create(builder, loop.getLoc());
++  Operation *clone = builder.clone(*loop, mapping);
++  func::ReturnOp::create(builder, loop.getLoc(), clone->getResults());
+ 
+   builder.setInsertionPoint(loop);
+-  func::CallOp::create(builder, loop.getLoc(), func, args);
++  auto call = func::CallOp::create(builder, loop.getLoc(), func, args);
++  loop->replaceAllUsesWith(call.getResults());
+   loop.erase();
+   return success();
+ }
+ 
+ struct TritonARM64SMEFuncOutlinePass
+     : public ::impl::TritonARM64SMEFuncOutlineBase<TritonARM64SMEFuncOutlinePass> {
++  using TritonARM64SMEFuncOutlineBase::TritonARM64SMEFuncOutlineBase;
++
+   void runOnOperation() override {
+     // Copy the list first: outlining adds functions to the module.
+     SmallVector<func::FuncOp> funcs(getOperation().getOps<func::FuncOp>());
+@@ -156,15 +221,23 @@ struct TritonARM64SMEFuncOutlinePass
+         continue;
+       // Outermost loops only: skip() keeps the walk out of a loop that is
+       // already being outlined.
+-      SmallVector<scf::ForOp> loops;
++      SmallVector<scf::ForOp> zaLoops, ssveLoops;
+       func.walk<WalkOrder::PreOrder>([&](scf::ForOp loop) {
+-        if (!usesZATiles(loop))
+-          return WalkResult::advance();
+-        loops.push_back(loop);
+-        return WalkResult::skip();
++        if (usesZATiles(loop)) {
++          zaLoops.push_back(loop);
++          return WalkResult::skip();
++        }
++        if (ssveReductions && isSSVEReductionNest(loop)) {
++          ssveLoops.push_back(loop);
++          return WalkResult::skip();
++        }
++        return WalkResult::advance();
+       });
+-      for (auto [index, loop] : llvm::enumerate(loops))
+-        if (failed(outlineLoop(loop, func, index)))
++      for (auto [index, loop] : llvm::enumerate(zaLoops))
++        if (failed(outlineLoop(loop, func, "sme", index, /*streaming=*/false)))
++          DBG("could not outline: " << loop);
++      for (auto [index, loop] : llvm::enumerate(ssveLoops))
++        if (failed(outlineLoop(loop, func, "ssve", index, /*streaming=*/true)))
+           DBG("could not outline: " << loop);
+     }
+   }
+@@ -173,6 +246,7 @@ struct TritonARM64SMEFuncOutlinePass
+ } // namespace
+ 
+ std::unique_ptr<OperationPass<ModuleOp>>
+-triton::createTritonARM64SMEFuncOutlinePass() {
+-  return std::make_unique<TritonARM64SMEFuncOutlinePass>();
++triton::createTritonARM64SMEFuncOutlinePass(
++    const TritonARM64SMEFuncOutlineOptions &options) {
++  return std::make_unique<TritonARM64SMEFuncOutlinePass>(options);
+ }
+diff --git a/qcom_arm64_backend/lib/OptimizeTritonShared/OptimizeTritonShared.cpp b/qcom_arm64_backend/lib/OptimizeTritonShared/OptimizeTritonShared.cpp
+index b960c5f..326709c 100644
+--- a/qcom_arm64_backend/lib/OptimizeTritonShared/OptimizeTritonShared.cpp
++++ b/qcom_arm64_backend/lib/OptimizeTritonShared/OptimizeTritonShared.cpp
+@@ -30,6 +30,8 @@
+ #include "mlir/InitAllPasses.h"
+ #include "llvm/Support/Debug.h"
+ 
++#include <cstdlib>
++
+ #include "OptimizeTritonShared/Passes.h"
+ 
+ namespace mlir {
+@@ -67,7 +69,12 @@ static void addOptimizationPassesForSME(mlir::OpPassManager &pm) {
+   pm.addPass(createCanonicalizerPass());
+   // Keep streaming mode to the ZA loop nests. This must run after the inliner
+   // above and before EnableArmStreamingPass below.
+-  pm.addPass(createTritonARM64SMEFuncOutlinePass());
++  // Experimental: TRITON_ARM64_SSVE_REDUCTIONS=1 also runs reduction loop
++  // nests in streaming mode (SSVE), at the streaming vector length.
++  TritonARM64SMEFuncOutlineOptions outlineOptions;
++  const char *ssve = std::getenv("TRITON_ARM64_SSVE_REDUCTIONS");
++  outlineOptions.ssveReductions = ssve && StringRef(ssve) == "1";
++  pm.addPass(createTritonARM64SMEFuncOutlinePass(outlineOptions));
+ 
+   pm.addPass(arm_sme::createVectorLegalizationPass());
+   pm.addPass(createConvertVectorToArmSMEPass());
+@@ -143,6 +150,13 @@ void addOptimizeTritonSharedPasses(mlir::OpPassManager &pm,
+   // The vector lowering pass bufferizes, but bufferization never frees what it
+   // allocates, so every program instance leaked its temporaries. This must run
+   // while loops are still structured (SME lowers them to cf below).
++  // Allocate the per-iteration temporaries (e.g. the buffers of masked loads in
++  // a Triton k-loop) once, before the loop. Each malloc/free is a call, which
++  // in streaming code also means leaving and re-entering streaming mode.
++  // TEMPORARY A/B switch for measurements; remove before upstreaming.
++  if (!std::getenv("TRITON_ARM64_NO_BUFFER_HOIST"))
++    pm.addNestedPass<func::FuncOp>(
++        bufferization::createBufferLoopHoistingPass());
+   bufferization::buildBufferDeallocationPipeline(pm);
+   // Deallocs whose aliasing is only known at runtime (e.g. buffers returned
+   // from loops) call a generated @dealloc_helper. Inline it: the driver
+diff --git a/qcom_arm64_backend/test/Transforms/arm64-matmul-to-mmt4d-pass.mlir b/qcom_arm64_backend/test/Transforms/arm64-matmul-to-mmt4d-pass.mlir
+index 873d903..a5606c6 100644
+--- a/qcom_arm64_backend/test/Transforms/arm64-matmul-to-mmt4d-pass.mlir
++++ b/qcom_arm64_backend/test/Transforms/arm64-matmul-to-mmt4d-pass.mlir
+@@ -1,4 +1,4 @@
+-// RUN: arm64-mlir-opt %s -triton-arm64-matmul-to-mmt4d | FileCheck %s
++// RUN: arm64-mlir-opt %s -split-input-file -triton-arm64-matmul-to-mmt4d | FileCheck %s
+ 
+ // CHECK-LABEL: func.func @test_matmul
+ // CHECK:       linalg.mmt4d
+@@ -10,3 +10,50 @@ func.func @test_matmul(%A: tensor<?x?xf32>,
+     outs(%C: tensor<?x?xf32>) -> tensor<?x?xf32>
+   return %0 : tensor<?x?xf32>
+ }
++
++// -----
++
++// A matmul that accumulates into a loop-carried tensor (a Triton k-loop): the
++// accumulator is packed once before the loop and unpacked once after it, and
++// the loop carries the packed tensor. Only A and B are packed per iteration.
++// CHECK-LABEL: func.func @hoist_packed_accumulator
++// CHECK:         %[[ACC0:.+]] = linalg.transpose ins(%{{.+}} : tensor<1x32x2x32xf32>) outs(%{{.+}} : tensor<1x2x32x32xf32>)
++// CHECK:         %[[R:.+]] = scf.for {{.+}} iter_args(%[[ACC:.+]] = %[[ACC0]]) -> (tensor<1x2x32x32xf32>)
++// CHECK-NOT:       tensor<32x64xf32>
++// CHECK:           %[[M:.+]] = linalg.mmt4d {{.+}} outs(%[[ACC]] : tensor<1x2x32x32xf32>)
++// CHECK:           scf.yield %[[M]]
++// CHECK:         linalg.transpose ins(%[[R]] : tensor<1x2x32x32xf32>)
++// CHECK:         tensor.collapse_shape {{.+}} into tensor<32x64xf32>
++func.func @hoist_packed_accumulator(%a: tensor<8x32x16xf32>, %b: tensor<8x16x64xf32>) -> tensor<32x64xf32> {
++  %c0 = arith.constant 0 : index
++  %c1 = arith.constant 1 : index
++  %c8 = arith.constant 8 : index
++  %zero = arith.constant 0.0 : f32
++  %empty = tensor.empty() : tensor<32x64xf32>
++  %init = linalg.fill ins(%zero : f32) outs(%empty : tensor<32x64xf32>) -> tensor<32x64xf32>
++  %r = scf.for %k = %c0 to %c8 step %c1 iter_args(%acc = %init) -> (tensor<32x64xf32>) {
++    %ak = tensor.extract_slice %a[%k, 0, 0] [1, 32, 16] [1, 1, 1] : tensor<8x32x16xf32> to tensor<32x16xf32>
++    %bk = tensor.extract_slice %b[%k, 0, 0] [1, 16, 64] [1, 1, 1] : tensor<8x16x64xf32> to tensor<16x64xf32>
++    %m = linalg.matmul ins(%ak, %bk : tensor<32x16xf32>, tensor<16x64xf32>) outs(%acc : tensor<32x64xf32>) -> tensor<32x64xf32>
++    scf.yield %m : tensor<32x64xf32>
++  }
++  return %r : tensor<32x64xf32>
++}
++
++// -----
++
++// The accumulator has another use in the loop, which needs it unpacked:
++// nothing is hoisted.
++// CHECK-LABEL: func.func @no_hoist_other_use
++// CHECK:         scf.for {{.+}} -> (tensor<32x64xf32>, tensor<32x64xf32>)
++// CHECK:           linalg.mmt4d
++func.func @no_hoist_other_use(%a: tensor<32x16xf32>, %b: tensor<16x64xf32>, %init: tensor<32x64xf32>) -> (tensor<32x64xf32>, tensor<32x64xf32>) {
++  %c0 = arith.constant 0 : index
++  %c1 = arith.constant 1 : index
++  %c8 = arith.constant 8 : index
++  %r:2 = scf.for %k = %c0 to %c8 step %c1 iter_args(%acc = %init, %prev = %init) -> (tensor<32x64xf32>, tensor<32x64xf32>) {
++    %m = linalg.matmul ins(%a, %b : tensor<32x16xf32>, tensor<16x64xf32>) outs(%acc : tensor<32x64xf32>) -> tensor<32x64xf32>
++    scf.yield %m, %acc : tensor<32x64xf32>, tensor<32x64xf32>
++  }
++  return %r#0, %r#1 : tensor<32x64xf32>, tensor<32x64xf32>
++}
+diff --git a/qcom_arm64_backend/test/Transforms/arm64-sme-func-outline.mlir b/qcom_arm64_backend/test/Transforms/arm64-sme-func-outline.mlir
+index fd778e2..53791c9 100644
+--- a/qcom_arm64_backend/test/Transforms/arm64-sme-func-outline.mlir
++++ b/qcom_arm64_backend/test/Transforms/arm64-sme-func-outline.mlir
+@@ -1,4 +1,5 @@
+ // RUN: arm64-mlir-opt %s -split-input-file -triton-arm64-sme-func-outline | FileCheck %s
++// RUN: arm64-mlir-opt %s -split-input-file -triton-arm64-sme-func-outline="ssve-reductions=1" | FileCheck %s --check-prefix=SSVE
+ 
+ // The outermost loop of a ZA tile loop nest moves into a private, internal
+ // function: one call per transpose. Only the buffers become arguments; vscale
+@@ -142,3 +143,104 @@ func.func @buffer_sized_by_vscale(%a: memref<64x64xf32>) {
+   memref.dealloc %buf : memref<?x?xf32>
+   return
+ }
++
++// -----
++
++// A loop with results, e.g. the pointer offsets a Triton k-loop carries: the
++// outlined function returns them and the call's results replace the loop's.
++// CHECK-LABEL: func.func @tile_loop_with_results(
++// CHECK:         %[[R:.+]]:2 = call @tile_loop_with_results_sme_0(%{{.+}}, %{{.+}}, %{{.+}}) : (memref<64x64xf32>, memref<64x64xf32>, index) -> (index, i32)
++// CHECK:         return %[[R]]#0, %[[R]]#1 : index, i32
++// CHECK-LABEL: func.func private @tile_loop_with_results_sme_0(
++// CHECK-SAME:    -> (index, i32)
++// CHECK:         %[[L:.+]]:2 = scf.for
++// CHECK:         return %[[L]]#0, %[[L]]#1 : index, i32
++func.func @tile_loop_with_results(%src: memref<64x64xf32>, %dst: memref<64x64xf32>, %off: index) -> (index, i32) {
++  %c0 = arith.constant 0 : index
++  %c4 = arith.constant 4 : index
++  %c64 = arith.constant 64 : index
++  %c1_i32 = arith.constant 1 : i32
++  %c0_i32 = arith.constant 0 : i32
++  %pad = arith.constant 0.0 : f32
++  %vscale = vector.vscale
++  %step = arith.muli %vscale, %c4 : index
++  %r:2 = scf.for %i = %c0 to %c64 step %step iter_args(%o = %off, %n = %c0_i32) -> (index, i32) {
++    %t = vector.transfer_read %src[%c0, %i], %pad {permutation_map = affine_map<(d0, d1) -> (d1, d0)>} : memref<64x64xf32>, vector<[4]x[4]xf32>
++    vector.transfer_write %t, %dst[%i, %c0] : vector<[4]x[4]xf32>, memref<64x64xf32>
++    %o2 = arith.addi %o, %c64 : index
++    %n2 = arith.addi %n, %c1_i32 : i32
++    scf.yield %o2, %n2 : index, i32
++  }
++  return %r#0, %r#1 : index, i32
++}
++
++// -----
++
++// ssve-reductions: a reduction loop over scalable vectors moves into a locally
++// streaming function (it switches mode itself, so the caller sets up the
++// arguments in normal mode). Its fixed-size accumulator is returned. Without
++// the option nothing happens: there are no ZA tiles.
++// CHECK-LABEL: func.func @ssve_reassoc_sum(
++// CHECK:         scf.for
++// CHECK-NOT:   func.func private
++// SSVE-LABEL:  func.func @ssve_reassoc_sum(
++// SSVE:          %[[R:.+]] = call @ssve_reassoc_sum_ssve_0(%{{.+}}) : (memref<1024xf32>) -> vector<1xf32>
++// SSVE:          return %[[R]]
++// SSVE-LABEL:  func.func private @ssve_reassoc_sum_ssve_0(
++// SSVE-SAME:     -> vector<1xf32>
++// SSVE-SAME:     llvm.arm_locally_streaming
++// SSVE:          vector.vscale
++// SSVE:          scf.for
++// SSVE:            vector.reduction <add>, %{{.+}}, %{{.+}} fastmath<reassoc> : vector<[4]xf32> into f32
++func.func @ssve_reassoc_sum(%in: memref<1024xf32>) -> vector<1xf32> {
++  %c0 = arith.constant 0 : index
++  %c4 = arith.constant 4 : index
++  %c1024 = arith.constant 1024 : index
++  %pad = arith.constant 0.0 : f32
++  %init = arith.constant dense<0.0> : vector<1xf32>
++  %vscale = vector.vscale
++  %step = arith.muli %vscale, %c4 : index
++  %r = scf.for %i = %c0 to %c1024 step %step iter_args(%acc = %init) -> (vector<1xf32>) {
++    %v = vector.transfer_read %in[%i], %pad : memref<1024xf32>, vector<[4]xf32>
++    %a = vector.extract %acc[0] : f32 from vector<1xf32>
++    %s = vector.reduction <add>, %v, %a fastmath<reassoc> : vector<[4]xf32> into f32
++    %b = vector.broadcast %s : f32 to vector<1xf32>
++    scf.yield %b : vector<1xf32>
++  }
++  return %r : vector<1xf32>
++}
++
++// -----
++
++// An in-order floating-point sum becomes FADDA, which is illegal in streaming
++// mode (llc: "Expanding reductions for scalable vectors is undefined"): such a
++// loop stays in the caller. A max (FMAXNMV) is fine.
++// SSVE-LABEL:  func.func @ssve_ordered_sum_stays(
++// SSVE:          scf.for
++// SSVE:            vector.reduction <add>
++// SSVE:          call @ssve_ordered_sum_stays_ssve_0(
++// SSVE-LABEL:  func.func private @ssve_ordered_sum_stays_ssve_0(
++// SSVE:            vector.reduction <maxnumf>
++// SSVE-NOT:    func.func private @ssve_ordered_sum_stays_ssve_1
++func.func @ssve_ordered_sum_stays(%in: memref<1024xf32>, %out: memref<2xf32>) {
++  %c0 = arith.constant 0 : index
++  %c1 = arith.constant 1 : index
++  %c4 = arith.constant 4 : index
++  %c1024 = arith.constant 1024 : index
++  %pad = arith.constant 0.0 : f32
++  %vscale = vector.vscale
++  %step = arith.muli %vscale, %c4 : index
++  %sum = scf.for %i = %c0 to %c1024 step %step iter_args(%acc = %pad) -> (f32) {
++    %v = vector.transfer_read %in[%i], %pad : memref<1024xf32>, vector<[4]xf32>
++    %s = vector.reduction <add>, %v, %acc : vector<[4]xf32> into f32
++    scf.yield %s : f32
++  }
++  %max = scf.for %i = %c0 to %c1024 step %step iter_args(%acc = %pad) -> (f32) {
++    %v = vector.transfer_read %in[%i], %pad : memref<1024xf32>, vector<[4]xf32>
++    %s = vector.reduction <maxnumf>, %v, %acc : vector<[4]xf32> into f32
++    scf.yield %s : f32
++  }
++  memref.store %sum, %out[%c0] : memref<2xf32>
++  memref.store %max, %out[%c1] : memref<2xf32>
++  return
++}
